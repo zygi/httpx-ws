@@ -1,3 +1,4 @@
+from asyncio import TaskGroup
 import contextlib
 import queue
 import typing
@@ -33,22 +34,27 @@ class UnhandledWebSocketEvent(ASGIWebSocketTransportError):
 
 
 class ASGIWebSocketAsyncNetworkStream(AsyncNetworkStream):
-    def __init__(self, app: ASGIApp, scope: Scope) -> None:
+    def __init__(self, app: ASGIApp, scope: Scope, use_blocking_portal: bool) -> None:
         self.app = app
         self.scope = scope
         self._receive_queue: queue.Queue[Message] = queue.Queue()
         self._send_queue: queue.Queue[Message] = queue.Queue()
         self.connection = wsproto.WSConnection(wsproto.ConnectionType.SERVER)
         self.connection.initiate_upgrade_connection(scope["headers"], scope["path"])
+        self._use_blocking_portal = use_blocking_portal
 
     async def __aenter__(
         self,
     ) -> typing.Tuple["ASGIWebSocketAsyncNetworkStream", bytes]:
-        self.exit_stack = contextlib.ExitStack()
-        self.portal = self.exit_stack.enter_context(
-            anyio.from_thread.start_blocking_portal("asyncio")
-        )
-        _: "Future[None]" = self.portal.start_task_soon(self._run)
+        self.exit_stack = contextlib.AsyncExitStack()
+        if self._use_blocking_portal:
+            self.portal = self.exit_stack.enter_context(
+                anyio.from_thread.start_blocking_portal("asyncio")
+            )
+            _: "Future[None]" = self.portal.start_task_soon(self._run)
+        else:
+            task_group = await self.exit_stack.enter_async_context(TaskGroup())
+            task_group.create_task(self._run())
 
         await self.send({"type": "websocket.connect"})
         message = await self.receive()
@@ -109,7 +115,7 @@ class ASGIWebSocketAsyncNetworkStream(AsyncNetworkStream):
 
     async def aclose(self) -> None:
         await self.send({"type": "websocket.close"})
-        self.exit_stack.close()
+        await self.exit_stack.aclose()
 
     async def send(self, message: Message) -> None:
         self._receive_queue.put(message)
@@ -156,9 +162,10 @@ class ASGIWebSocketAsyncNetworkStream(AsyncNetworkStream):
 
 
 class ASGIWebSocketTransport(ASGITransport):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, use_blocking_portal: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.exit_stack: typing.Optional[contextlib.AsyncExitStack] = None
+        self._use_blocking_portal = use_blocking_portal
 
     async def handle_async_request(self, request: Request) -> Response:
         scheme = request.url.scheme
@@ -197,7 +204,7 @@ class ASGIWebSocketTransport(ASGITransport):
         self.scope = scope
         self.exit_stack = contextlib.AsyncExitStack()
         stream, accept_response = await self.exit_stack.enter_async_context(
-            ASGIWebSocketAsyncNetworkStream(self.app, self.scope)
+            ASGIWebSocketAsyncNetworkStream(self.app, self.scope, self._use_blocking_portal)
         )
 
         accept_response_lines = accept_response.decode("utf-8").splitlines()
